@@ -4,22 +4,27 @@
  * pull and decode them, so the durable-indexer swap (Blue/Black, belts/00-strategy) is a
  * one-file change. RPC-direct for the MVP; degrades to [] on any failure.
  */
-import { Address, scValToNative, xdr } from '@stellar/stellar-sdk';
+import { Address, scValToNative, xdr, type rpc } from '@stellar/stellar-sdk';
 import { EVENTS } from '@alvinmunk/shared';
 import { server, config } from './stellar';
 import { shareInFlight } from './utils';
 
 /**
  * RPC event retention is ~24h; staying within ~9000 ledgers keeps `getEvents` returning
- * rows instead of an out-of-range error (≥16k returns 0 events).
+ * rows instead of an out-of-range error (≥16k returns 0 events). It must also stay under
+ * the 10,000 ledgers stellar-rpc scans per request: only then does a short page mean the
+ * scan reached the latest ledger (see `scanContractEvents`).
  */
 export const EVENT_LEDGER_WINDOW = 9000;
 
-/** Events per RPC page. Kept small so each request stays well under the RPC size limit. */
-export const PAGE_SIZE = 200;
+/** Events per `getEvents` page — well under stellar-rpc's default 10,000 `limit` ceiling. */
+export const PAGE_SIZE = 1000;
+
 /**
- * Maximum pages fetched per call. 10 × 200 = 2000 events maximum per fetch cycle.
- * Bounds the number of RPC round-trips so a hot window can't fan out unbounded.
+ * Most pages one scan follows (10 × 1000 = 10,000 events), so a hot window — or the
+ * leaderboard's 5s poll — can't fan out into unbounded requests. A window holding more
+ * than that returns only its oldest 10,000 events; at that volume the durable indexer
+ * (#109) has to replace RPC-direct reads.
  */
 export const MAX_PAGES = 10;
 
@@ -45,11 +50,11 @@ export function decodeScVal(v: xdr.ScVal | string): unknown {
 }
 
 /**
- * Recent reputation-contract events (decoded), in RPC order (oldest-first). Returns [] if
- * the contract isn't deployed or RPC is unavailable so every caller degrades gracefully.
- * Follows the RPC cursor up to MAX_PAGES pages so a busy window never silently drops the
- * newest events. Concurrent callers (feed, constellation, badges mounting together) share
- * one scan.
+ * Every reputation-contract event in the window (decoded), in RPC order (oldest-first), so
+ * the last element is the newest — the scan follows the RPC cursor across pages up to
+ * MAX_PAGES. Returns [] if the contract isn't deployed or RPC is unavailable so every
+ * caller degrades gracefully. Concurrent callers (feed, constellation, badges mounting
+ * together) share one scan.
  */
 export async function fetchReputationEvents(): Promise<RepEvent[]> {
   return fetchContractEvents(config.contracts.reputation, ['*', '*'], PAGE_SIZE * MAX_PAGES);
@@ -81,6 +86,18 @@ function fetchContractEvents(contractId: string, topics: string[], limit: number
   );
 }
 
+/**
+ * The first `limit` matching events of the window, oldest-first, paged through with the
+ * RPC cursor (at most MAX_PAGES requests). stellar-rpc's `getEvents` contract:
+ *   - `startLedger` and `cursor` are mutually exclusive, so only the first page sends
+ *     `startLedger`; every later page sends just the previous response's `cursor`.
+ *   - Each request scans at most 10,000 ledgers from its start and returns up to `limit`
+ *     events, ascending. A full page's `cursor` is its last event; a short page's is the
+ *     end of the scanned range — and as the window fits in one scan, that end is the
+ *     latest ledger, so a short page means the scan has caught up.
+ * A request failing part-way drops the whole scan to []: an oldest-only prefix would read
+ * to every caller as "nothing happened since".
+ */
 async function scanContractEvents(contractId: string, topics: string[], limit: number): Promise<RepEvent[]> {
   let startLedger: number;
   try {
@@ -90,16 +107,17 @@ async function scanContractEvents(contractId: string, topics: string[], limit: n
     return [];
   }
 
-  const filters: Parameters<typeof server.getEvents>[0]['filters'] = [
+  const filters: rpc.Api.EventFilter[] = [
     { type: 'contract', contractIds: [contractId], topics: [topics] },
   ];
-  const pageSize = Math.min(PAGE_SIZE, limit);
-
   const out: RepEvent[] = [];
   try {
-    let req: Parameters<typeof server.getEvents>[0] = { startLedger, filters, limit: pageSize };
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const res = await server.getEvents(req);
+    let cursor: string | undefined;
+    for (let page = 0; page < MAX_PAGES && out.length < limit; page++) {
+      const pageLimit = Math.min(PAGE_SIZE, limit - out.length);
+      const res = await server.getEvents(
+        cursor ? { filters, cursor, limit: pageLimit } : { filters, startLedger, limit: pageLimit },
+      );
       for (const ev of res.events) {
         out.push({
           topics: (ev.topic as Array<xdr.ScVal | string>).map(decodeScVal),
@@ -107,11 +125,12 @@ async function scanContractEvents(contractId: string, topics: string[], limit: n
           ledger: ev.ledger,
         });
       }
-      if (res.events.length < pageSize || out.length >= limit) break;
-      req = { cursor: res.cursor, filters, limit: pageSize };
+      // Caught up — or a full page without a cursor, which must not restart from startLedger.
+      if (res.events.length < pageLimit || !res.cursor) break;
+      cursor = res.cursor;
     }
   } catch {
-    return out; // return whatever we collected before the failure
+    return [];
   }
   return out;
 }

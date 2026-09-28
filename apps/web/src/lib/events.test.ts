@@ -11,7 +11,14 @@ vi.mock('./stellar', () => ({
   config: { contracts: { reputation: 'CREP', rewards: 'CRWD' } },
 }));
 
-import { decodeScVal, fetchReputationEvents, fetchTipsSent, PAGE_SIZE, MAX_PAGES } from './events';
+import {
+  decodeScVal,
+  fetchReputationEvents,
+  fetchTipsSent,
+  EVENT_LEDGER_WINDOW,
+  MAX_PAGES,
+  PAGE_SIZE,
+} from './events';
 
 /**
  * Helper: assert two Uint8Arrays have the same bytes.
@@ -232,8 +239,9 @@ describe('contract event reads', () => {
     expect(getEventsMock).toHaveBeenCalledWith({
       startLedger: 11_000,
       filters: [{ type: 'contract', contractIds: ['CREP'], topics: [['*', '*']] }],
-      limit: PAGE_SIZE,
+      limit: 1000,
     });
+    expect(getEventsMock).toHaveBeenCalledTimes(1); // a quiet window is still one request
   });
 
   it('shares one scan between concurrent callers, and re-reads once it settles', async () => {
@@ -254,9 +262,14 @@ describe('contract event reads', () => {
           ledger: 19_999,
         },
       ],
+      cursor: 'after-the-first-tip',
     });
 
     const events = await fetchTipsSent(from);
+
+    // Only the first tip is wanted: one request for one event, and no follow-up page.
+    expect(getEventsMock).toHaveBeenCalledTimes(1);
+    expect(getEventsMock.mock.calls[0][0].limit).toBe(1);
 
     const filter = getEventsMock.mock.calls[0][0].filters[0];
     expect(filter.contractIds).toEqual(['CRWD']);
@@ -274,81 +287,116 @@ describe('contract event reads', () => {
     getEventsMock.mockRejectedValue(new Error('rpc down'));
     await expect(fetchReputationEvents()).resolves.toEqual([]);
   });
-});
 
-describe('fetchReputationEvents — cursor pagination', () => {
-  beforeEach(() => {
-    getLatestLedgerMock.mockReset().mockResolvedValue({ sequence: 10000 });
-    getEventsMock.mockReset();
-  });
+  describe('cursor pagination', () => {
+    const SOCIAL = xdr.ScVal.scvSymbol('social');
+    const WHO = xdr.ScVal.scvSymbol('who');
+    const LATEST = 20_000;
+    const eventId = (ledger: number, i: number) =>
+      `${String(ledger).padStart(19, '0')}-${String(i).padStart(10, '0')}`;
 
-  /** Build a minimal raw event object that fetchReputationEvents can decode. */
-  function makeRawEvent(ledger: number) {
-    return {
-      topic: [xdr.ScVal.scvSymbol('social'), xdr.ScVal.scvSymbol(`addr${ledger}`)],
-      value: xdr.ScVal.scvU32(ledger),
-      ledger,
-    };
-  }
+    /**
+     * Serve `count` events (data = their index, ascending, three per ledger from the window
+     * start) the way stellar-rpc's getEvents does: `startLedger` XOR `cursor`, at most `limit`
+     * events per page, and a cursor that is the last event on a full page or the end of the
+     * scanned range on a short one.
+     */
+    function serveWindow(count: number) {
+      const all = Array.from({ length: count }, (_, i) => {
+        const ledger = LATEST - EVENT_LEDGER_WINDOW + Math.floor(i / 3);
+        return { id: eventId(ledger, i), ledger, topic: [SOCIAL, WHO], value: xdr.ScVal.scvU32(i) };
+      });
+      getEventsMock.mockImplementation(async (req: { startLedger?: number; cursor?: string; limit: number }) => {
+        const { startLedger, cursor, limit } = req;
+        if (cursor !== undefined && startLedger !== undefined) {
+          throw new Error('ledger ranges and cursor cannot both be set');
+        }
+        if (cursor === undefined && !(Number(startLedger) > 0)) throw new Error('startLedger must be positive');
+        const rest =
+          cursor === undefined
+            ? all.filter((e) => e.ledger >= Number(startLedger))
+            : all.filter((e) => e.id > cursor);
+        const events = rest.slice(0, limit);
+        const next = events.length === limit ? events[events.length - 1].id : eventId(LATEST, 4_294_967_295);
+        return { events, cursor: next, latestLedger: LATEST, oldestLedger: 1 };
+      });
+      return all;
+    }
+    const indexes = (events: { data: unknown }[]) => events.map((e) => e.data);
+    const range = (n: number) => Array.from({ length: n }, (_, i) => i);
 
-  it('returns all events from a single page when the page is not full', async () => {
-    const events = [makeRawEvent(1), makeRawEvent(2)];
-    getEventsMock.mockResolvedValue({ events, cursor: 'cur1' });
+    it('keeps the window inside one RPC ledger scan, so a short page means caught up', () => {
+      // stellar-rpc scans at most 10,000 ledgers per getEvents request (LedgerScanLimit).
+      expect(EVENT_LEDGER_WINDOW).toBeLessThan(10_000);
+    });
 
-    const result = await fetchReputationEvents();
+    it('concatenates two pages in order, so the newest event is returned', async () => {
+      const all = serveWindow(PAGE_SIZE + 1); // the newest event is alone on page 2
 
-    expect(getEventsMock).toHaveBeenCalledTimes(1);
-    expect(result).toHaveLength(2);
-    expect(result[0].ledger).toBe(1);
-    expect(result[1].ledger).toBe(2);
-  });
+      const events = await fetchReputationEvents();
 
-  it('follows the cursor across two pages and concatenates events in order', async () => {
-    // Page 1: exactly PAGE_SIZE events → triggers a follow-up request.
-    const page1 = Array.from({ length: PAGE_SIZE }, (_, i) => makeRawEvent(i + 1));
-    // Page 2: one event (the newest) → fewer than PAGE_SIZE, loop stops.
-    const page2 = [makeRawEvent(PAGE_SIZE + 1)];
+      expect(indexes(events)).toEqual(range(PAGE_SIZE + 1));
+      expect(events[events.length - 1].ledger).toBe(all[PAGE_SIZE].ledger);
+      expect(getEventsMock).toHaveBeenCalledTimes(2);
+      // Page 2 continues from page 1's last event and must not also send startLedger.
+      const second = getEventsMock.mock.calls[1][0];
+      expect(second.cursor).toBe(all[PAGE_SIZE - 1].id);
+      expect(second).not.toHaveProperty('startLedger');
+    });
 
-    getEventsMock
-      .mockResolvedValueOnce({ events: page1, cursor: 'cursor-after-page1' })
-      .mockResolvedValueOnce({ events: page2, cursor: 'cursor-after-page2' });
+    it('confirms an exactly-full last page with one more request', async () => {
+      serveWindow(2 * PAGE_SIZE);
 
-    const result = await fetchReputationEvents();
+      const events = await fetchReputationEvents();
 
-    // Both pages combined, in order.
-    expect(result).toHaveLength(PAGE_SIZE + 1);
-    expect(result[0].ledger).toBe(1);
-    expect(result[PAGE_SIZE - 1].ledger).toBe(PAGE_SIZE);
-    expect(result[PAGE_SIZE].ledger).toBe(PAGE_SIZE + 1); // newest event is present
+      expect(indexes(events)).toEqual(range(2 * PAGE_SIZE));
+      expect(getEventsMock).toHaveBeenCalledTimes(3); // the third page comes back empty
+    });
 
-    // Second call must use the cursor from page 1, not startLedger.
-    expect(getEventsMock).toHaveBeenCalledTimes(2);
-    const secondCall = getEventsMock.mock.calls[1][0];
-    expect(secondCall.cursor).toBe('cursor-after-page1');
-    expect(secondCall.startLedger).toBeUndefined();
-  });
+    it('stops after MAX_PAGES requests on a window busier than the cap', async () => {
+      serveWindow(PAGE_SIZE * MAX_PAGES + 7);
 
-  it('stops after MAX_PAGES even when every page is full', async () => {
-    const fullPage = Array.from({ length: PAGE_SIZE }, (_, i) => makeRawEvent(i + 1));
-    // Always return a full page — without the cap this would loop forever.
-    getEventsMock.mockResolvedValue({ events: fullPage, cursor: 'cur' });
+      const events = await fetchReputationEvents();
 
-    const result = await fetchReputationEvents();
+      expect(getEventsMock).toHaveBeenCalledTimes(MAX_PAGES);
+      expect(indexes(events)).toEqual(range(PAGE_SIZE * MAX_PAGES)); // documented ceiling: the oldest events win
+    });
 
-    expect(getEventsMock).toHaveBeenCalledTimes(MAX_PAGES);
-    expect(result).toHaveLength(PAGE_SIZE * MAX_PAGES);
-  });
+    it('ends the scan on a full page without a cursor instead of re-reading from startLedger', async () => {
+      const page = serveWindow(PAGE_SIZE);
+      getEventsMock.mockResolvedValue({ events: page, cursor: '' });
 
-  it('returns events collected so far when RPC throws mid-pagination', async () => {
-    const page1 = Array.from({ length: PAGE_SIZE }, (_, i) => makeRawEvent(i + 1));
-    getEventsMock
-      .mockResolvedValueOnce({ events: page1, cursor: 'cur1' })
-      .mockRejectedValueOnce(new Error('RPC timeout'));
+      const events = await fetchReputationEvents();
 
-    const result = await fetchReputationEvents();
+      expect(getEventsMock).toHaveBeenCalledTimes(1);
+      expect(indexes(events)).toEqual(range(PAGE_SIZE)); // no duplicated first page
+    });
 
-    // Page 1 events must be present; no crash.
-    expect(result).toHaveLength(PAGE_SIZE);
-    expect(result[0].ledger).toBe(1);
+    it('drops the whole scan when a later page fails, and retries on the next call', async () => {
+      serveWindow(PAGE_SIZE + 1);
+      const rpcWindow = getEventsMock.getMockImplementation()!;
+      getEventsMock.mockImplementationOnce(rpcWindow).mockRejectedValueOnce(new Error('rpc timeout'));
+
+      // An oldest-only prefix would pass for "nothing newer happened", so it is not returned.
+      await expect(fetchReputationEvents()).resolves.toEqual([]);
+      expect(getEventsMock).toHaveBeenCalledTimes(2);
+
+      expect(indexes(await fetchReputationEvents())).toEqual(range(PAGE_SIZE + 1));
+    });
+
+    it('shares one multi-page scan between concurrent callers', async () => {
+      serveWindow(2 * PAGE_SIZE + 1);
+
+      const [a, b, c] = await Promise.all([fetchReputationEvents(), fetchReputationEvents(), fetchReputationEvents()]);
+
+      expect(getLatestLedgerMock).toHaveBeenCalledTimes(1);
+      expect(getEventsMock).toHaveBeenCalledTimes(3); // one 3-page scan, not three
+      expect(b).toBe(a);
+      expect(c).toBe(a);
+      expect(indexes(a)).toEqual(range(2 * PAGE_SIZE + 1));
+
+      await fetchReputationEvents(); // settled scans are not cached
+      expect(getEventsMock).toHaveBeenCalledTimes(6);
+    });
   });
 });

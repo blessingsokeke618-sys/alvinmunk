@@ -1,15 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { xdr, Address } from '@stellar/stellar-sdk';
-import { decodeScVal, fetchReputationEvents, PAGE_SIZE, MAX_PAGES } from './events';
+import { xdr, Address, StrKey } from '@stellar/stellar-sdk';
 
-// Mock the stellar module so tests don't need a live RPC connection.
-vi.mock('./stellar', () => ({
-  config: { contracts: { reputation: 'CTEST' } },
-  server: {
-    getLatestLedger: vi.fn(),
-    getEvents: vi.fn(),
-  },
+const { getLatestLedgerMock, getEventsMock } = vi.hoisted(() => ({
+  getLatestLedgerMock: vi.fn(),
+  getEventsMock: vi.fn(),
 }));
+
+vi.mock('./stellar', () => ({
+  server: { getLatestLedger: getLatestLedgerMock, getEvents: getEventsMock },
+  config: { contracts: { reputation: 'CREP', rewards: 'CRWD' } },
+}));
+
+import { decodeScVal, fetchReputationEvents, fetchTipsSent, PAGE_SIZE, MAX_PAGES } from './events';
 
 /**
  * Helper: assert two Uint8Arrays have the same bytes.
@@ -217,16 +219,67 @@ describe('decodeScVal', () => {
   });
 });
 
-describe('fetchReputationEvents — cursor pagination', () => {
-  // Pull in the mocked server after vi.mock has run.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let server: any;
+describe('contract event reads', () => {
+  const sym = (v: string) => xdr.ScVal.scvSymbol(v).toXDR('base64');
 
-  beforeEach(async () => {
-    vi.resetAllMocks();
-    const stellar = await import('./stellar');
-    server = stellar.server;
-    server.getLatestLedger.mockResolvedValue({ sequence: 10000 });
+  beforeEach(() => {
+    getLatestLedgerMock.mockReset().mockResolvedValue({ sequence: 20_000 });
+    getEventsMock.mockReset().mockResolvedValue({ events: [] });
+  });
+
+  it('scans the reputation window with the 2-segment wildcard', async () => {
+    await fetchReputationEvents();
+    expect(getEventsMock).toHaveBeenCalledWith({
+      startLedger: 11_000,
+      filters: [{ type: 'contract', contractIds: ['CREP'], topics: [['*', '*']] }],
+      limit: PAGE_SIZE,
+    });
+  });
+
+  it('shares one scan between concurrent callers, and re-reads once it settles', async () => {
+    await Promise.all([fetchReputationEvents(), fetchReputationEvents(), fetchReputationEvents()]);
+    expect(getEventsMock).toHaveBeenCalledTimes(1);
+    await fetchReputationEvents();
+    expect(getEventsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('reads tips with a 3-segment filter pinned to the sender', async () => {
+    const from = StrKey.encodeEd25519PublicKey(Buffer.alloc(32, 1));
+    const to = Address.contract(Buffer.alloc(32, 0xca)).toString(); // passkey wallets are C…
+    getEventsMock.mockResolvedValue({
+      events: [
+        {
+          topic: [sym('tipped'), new Address(from).toScVal().toXDR('base64'), new Address(to).toScVal().toXDR('base64')],
+          value: xdr.ScVal.scvI128(new xdr.Int128Parts({ lo: xdr.Uint64.fromString('5'), hi: xdr.Int64.fromString('0') })).toXDR('base64'),
+          ledger: 19_999,
+        },
+      ],
+    });
+
+    const events = await fetchTipsSent(from);
+
+    const filter = getEventsMock.mock.calls[0][0].filters[0];
+    expect(filter.contractIds).toEqual(['CRWD']);
+    // ('tipped', from, to) has THREE topics; a 2-segment filter would never match it.
+    expect(filter.topics).toEqual([[sym('tipped'), new Address(from).toScVal().toXDR('base64'), '*']]);
+    expect(events).toEqual([{ topics: ['tipped', from, to], data: 5n, ledger: 19_999 }]);
+  });
+
+  it('returns no tips for a malformed sender without calling RPC', async () => {
+    await expect(fetchTipsSent('not-an-address')).resolves.toEqual([]);
+    expect(getEventsMock).not.toHaveBeenCalled();
+  });
+
+  it('degrades to [] when RPC fails', async () => {
+    getEventsMock.mockRejectedValue(new Error('rpc down'));
+    await expect(fetchReputationEvents()).resolves.toEqual([]);
+  });
+});
+
+describe('fetchReputationEvents — cursor pagination', () => {
+  beforeEach(() => {
+    getLatestLedgerMock.mockReset().mockResolvedValue({ sequence: 10000 });
+    getEventsMock.mockReset();
   });
 
   /** Build a minimal raw event object that fetchReputationEvents can decode. */
@@ -240,11 +293,11 @@ describe('fetchReputationEvents — cursor pagination', () => {
 
   it('returns all events from a single page when the page is not full', async () => {
     const events = [makeRawEvent(1), makeRawEvent(2)];
-    server.getEvents.mockResolvedValue({ events, cursor: 'cur1' });
+    getEventsMock.mockResolvedValue({ events, cursor: 'cur1' });
 
     const result = await fetchReputationEvents();
 
-    expect(server.getEvents).toHaveBeenCalledTimes(1);
+    expect(getEventsMock).toHaveBeenCalledTimes(1);
     expect(result).toHaveLength(2);
     expect(result[0].ledger).toBe(1);
     expect(result[1].ledger).toBe(2);
@@ -256,7 +309,7 @@ describe('fetchReputationEvents — cursor pagination', () => {
     // Page 2: one event (the newest) → fewer than PAGE_SIZE, loop stops.
     const page2 = [makeRawEvent(PAGE_SIZE + 1)];
 
-    server.getEvents
+    getEventsMock
       .mockResolvedValueOnce({ events: page1, cursor: 'cursor-after-page1' })
       .mockResolvedValueOnce({ events: page2, cursor: 'cursor-after-page2' });
 
@@ -269,8 +322,8 @@ describe('fetchReputationEvents — cursor pagination', () => {
     expect(result[PAGE_SIZE].ledger).toBe(PAGE_SIZE + 1); // newest event is present
 
     // Second call must use the cursor from page 1, not startLedger.
-    expect(server.getEvents).toHaveBeenCalledTimes(2);
-    const secondCall = server.getEvents.mock.calls[1][0];
+    expect(getEventsMock).toHaveBeenCalledTimes(2);
+    const secondCall = getEventsMock.mock.calls[1][0];
     expect(secondCall.cursor).toBe('cursor-after-page1');
     expect(secondCall.startLedger).toBeUndefined();
   });
@@ -278,17 +331,17 @@ describe('fetchReputationEvents — cursor pagination', () => {
   it('stops after MAX_PAGES even when every page is full', async () => {
     const fullPage = Array.from({ length: PAGE_SIZE }, (_, i) => makeRawEvent(i + 1));
     // Always return a full page — without the cap this would loop forever.
-    server.getEvents.mockResolvedValue({ events: fullPage, cursor: 'cur' });
+    getEventsMock.mockResolvedValue({ events: fullPage, cursor: 'cur' });
 
     const result = await fetchReputationEvents();
 
-    expect(server.getEvents).toHaveBeenCalledTimes(MAX_PAGES);
+    expect(getEventsMock).toHaveBeenCalledTimes(MAX_PAGES);
     expect(result).toHaveLength(PAGE_SIZE * MAX_PAGES);
   });
 
   it('returns events collected so far when RPC throws mid-pagination', async () => {
     const page1 = Array.from({ length: PAGE_SIZE }, (_, i) => makeRawEvent(i + 1));
-    server.getEvents
+    getEventsMock
       .mockResolvedValueOnce({ events: page1, cursor: 'cur1' })
       .mockRejectedValueOnce(new Error('RPC timeout'));
 

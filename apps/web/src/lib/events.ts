@@ -13,6 +13,14 @@ import { server, config } from './stellar';
  */
 export const EVENT_LEDGER_WINDOW = 9000;
 
+/** Events per RPC page. Kept small so each request stays well under the RPC size limit. */
+export const PAGE_SIZE = 200;
+/**
+ * Maximum pages fetched per call. 10 × 200 = 2000 events maximum per fetch cycle.
+ * Bounds the number of RPC round-trips so a hot window can't fan out unbounded.
+ */
+export const MAX_PAGES = 10;
+
 /** A decoded contract event: topics + value already run through scValToNative. */
 export interface RepEvent {
   topics: unknown[];
@@ -37,8 +45,10 @@ export function decodeScVal(v: xdr.ScVal | string): unknown {
 /**
  * Recent reputation-contract events (decoded), in RPC order (oldest-first). Returns [] if
  * the contract isn't deployed or RPC is unavailable so every caller degrades gracefully.
+ * Follows the RPC cursor up to MAX_PAGES pages so a busy window never silently drops the
+ * newest events.
  */
-export async function fetchReputationEvents(limit = 1000): Promise<RepEvent[]> {
+export async function fetchReputationEvents(): Promise<RepEvent[]> {
   if (!config.contracts.reputation) return [];
 
   let startLedger: number;
@@ -49,20 +59,27 @@ export async function fetchReputationEvents(limit = 1000): Promise<RepEvent[]> {
     return [];
   }
 
+  const filters: Parameters<typeof server.getEvents>[0]['filters'] = [
+    { type: 'contract', contractIds: [config.contracts.reputation], topics: [['*', '*']] },
+  ];
+
+  const out: RepEvent[] = [];
   try {
-    const res = await server.getEvents({
-      startLedger,
-      filters: [
-        { type: 'contract', contractIds: [config.contracts.reputation], topics: [['*', '*']] },
-      ],
-      limit,
-    });
-    return res.events.map((ev) => ({
-      topics: (ev.topic as Array<xdr.ScVal | string>).map(decodeScVal),
-      data: decodeScVal(ev.value as xdr.ScVal | string),
-      ledger: ev.ledger,
-    }));
+    let req: Parameters<typeof server.getEvents>[0] = { startLedger, filters, limit: PAGE_SIZE };
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const res = await server.getEvents(req);
+      for (const ev of res.events) {
+        out.push({
+          topics: (ev.topic as Array<xdr.ScVal | string>).map(decodeScVal),
+          data: decodeScVal(ev.value as xdr.ScVal | string),
+          ledger: ev.ledger,
+        });
+      }
+      if (res.events.length < PAGE_SIZE) break;
+      req = { cursor: res.cursor, filters, limit: PAGE_SIZE };
+    }
   } catch {
-    return [];
+    return out; // return whatever we collected before the failure
   }
+  return out;
 }

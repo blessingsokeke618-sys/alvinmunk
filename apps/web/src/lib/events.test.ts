@@ -1,6 +1,15 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { xdr, Address } from '@stellar/stellar-sdk';
-import { decodeScVal } from './events';
+import { decodeScVal, fetchReputationEvents, PAGE_SIZE, MAX_PAGES } from './events';
+
+// Mock the stellar module so tests don't need a live RPC connection.
+vi.mock('./stellar', () => ({
+  config: { contracts: { reputation: 'CTEST' } },
+  server: {
+    getLatestLedger: vi.fn(),
+    getEvents: vi.fn(),
+  },
+}));
 
 /**
  * Helper: assert two Uint8Arrays have the same bytes.
@@ -205,5 +214,88 @@ describe('decodeScVal', () => {
       expect(() => decodeScVal('AAAAAA==')).not.toThrow();
       expect(decodeScVal('AAAAAA==')).toBeNull();
     });
+  });
+});
+
+describe('fetchReputationEvents — cursor pagination', () => {
+  // Pull in the mocked server after vi.mock has run.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let server: any;
+
+  beforeEach(async () => {
+    vi.resetAllMocks();
+    const stellar = await import('./stellar');
+    server = stellar.server;
+    server.getLatestLedger.mockResolvedValue({ sequence: 10000 });
+  });
+
+  /** Build a minimal raw event object that fetchReputationEvents can decode. */
+  function makeRawEvent(ledger: number) {
+    return {
+      topic: [xdr.ScVal.scvSymbol('social'), xdr.ScVal.scvSymbol(`addr${ledger}`)],
+      value: xdr.ScVal.scvU32(ledger),
+      ledger,
+    };
+  }
+
+  it('returns all events from a single page when the page is not full', async () => {
+    const events = [makeRawEvent(1), makeRawEvent(2)];
+    server.getEvents.mockResolvedValue({ events, cursor: 'cur1' });
+
+    const result = await fetchReputationEvents();
+
+    expect(server.getEvents).toHaveBeenCalledTimes(1);
+    expect(result).toHaveLength(2);
+    expect(result[0].ledger).toBe(1);
+    expect(result[1].ledger).toBe(2);
+  });
+
+  it('follows the cursor across two pages and concatenates events in order', async () => {
+    // Page 1: exactly PAGE_SIZE events → triggers a follow-up request.
+    const page1 = Array.from({ length: PAGE_SIZE }, (_, i) => makeRawEvent(i + 1));
+    // Page 2: one event (the newest) → fewer than PAGE_SIZE, loop stops.
+    const page2 = [makeRawEvent(PAGE_SIZE + 1)];
+
+    server.getEvents
+      .mockResolvedValueOnce({ events: page1, cursor: 'cursor-after-page1' })
+      .mockResolvedValueOnce({ events: page2, cursor: 'cursor-after-page2' });
+
+    const result = await fetchReputationEvents();
+
+    // Both pages combined, in order.
+    expect(result).toHaveLength(PAGE_SIZE + 1);
+    expect(result[0].ledger).toBe(1);
+    expect(result[PAGE_SIZE - 1].ledger).toBe(PAGE_SIZE);
+    expect(result[PAGE_SIZE].ledger).toBe(PAGE_SIZE + 1); // newest event is present
+
+    // Second call must use the cursor from page 1, not startLedger.
+    expect(server.getEvents).toHaveBeenCalledTimes(2);
+    const secondCall = server.getEvents.mock.calls[1][0];
+    expect(secondCall.cursor).toBe('cursor-after-page1');
+    expect(secondCall.startLedger).toBeUndefined();
+  });
+
+  it('stops after MAX_PAGES even when every page is full', async () => {
+    const fullPage = Array.from({ length: PAGE_SIZE }, (_, i) => makeRawEvent(i + 1));
+    // Always return a full page — without the cap this would loop forever.
+    server.getEvents.mockResolvedValue({ events: fullPage, cursor: 'cur' });
+
+    const result = await fetchReputationEvents();
+
+    expect(server.getEvents).toHaveBeenCalledTimes(MAX_PAGES);
+    expect(result).toHaveLength(PAGE_SIZE * MAX_PAGES);
+  });
+
+  it('returns events collected so far when RPC throws mid-pagination', async () => {
+    const page1 = Array.from({ length: PAGE_SIZE }, (_, i) => makeRawEvent(i + 1));
+    server.getEvents
+      .mockResolvedValueOnce({ events: page1, cursor: 'cur1' })
+      .mockRejectedValueOnce(new Error('RPC timeout'));
+
+    const result = await fetchReputationEvents();
+
+    // Page 1 events must be present; no crash.
+    expect(result).toHaveLength(PAGE_SIZE);
+    expect(result[0].ledger).toBe(1);
   });
 });
